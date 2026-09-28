@@ -18,7 +18,10 @@ class ModelConfig:
     init_scale: float = 0.01
     init_opacity: float = 0.1
 
-
+    # Existing trained 3DGS checkpoint (.ply).
+    # Empty string means: initialize from scene.point_cloud as before.
+    pretrained_ply: str = ""
+    
 @dataclass
 class TrainConfig:
     """Training loop settings."""
