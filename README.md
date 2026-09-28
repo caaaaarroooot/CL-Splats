@@ -345,6 +345,3 @@ Parts of this public reimplementation were developed and verified with the help 
     year={2025}
 }
 ```
-
-
-temp
