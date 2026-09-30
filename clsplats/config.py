@@ -96,6 +96,12 @@ class HistoryConfig:
 
     log_history: bool = False
 
+@dataclass
+class DiagnosticsConfig:
+    """Diagnostic logging settings."""
+
+    enabled: bool = False
+    out_dir: str = "outputs/diagnostics"
 
 @dataclass
 class CLSplatsConfig:
@@ -122,10 +128,3 @@ class CLSplatsConfig:
     wandb_project: str = "cl-splats"
     wandb_run_name: str = ""
     wandb_mode: str = "offline"
-
-@dataclass
-class DiagnosticsConfig:
-    """Diagnostic logging settings."""
-
-    enabled: bool = False
-    out_dir: str = "outputs/diagnostics"
