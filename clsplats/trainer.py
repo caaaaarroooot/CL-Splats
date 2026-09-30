@@ -10,7 +10,7 @@ import time
 from datetime import datetime
 from collections import defaultdict
 from pathlib import Path
-from random import Random, randint
+from random import Random, randint, seed as random_seed
 from typing import TYPE_CHECKING, List
 
 import numpy as np
@@ -183,6 +183,15 @@ class CLSplatsTrainer:
 
     def __init__(self, cfg: CLSplatsConfig, scene: SceneInfo):
         self.cfg = cfg
+
+        experiment_seed = int(self.cfg.train.view_sample_seed)
+
+        random_seed(experiment_seed)
+        np.random.seed(experiment_seed)
+        torch.manual_seed(experiment_seed)
+
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(experiment_seed)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.timestep = 0
         self.active_mask = None
@@ -574,6 +583,7 @@ class CLSplatsTrainer:
                     "active_gaussian_ratio": (
                         active_gaussians / total_gaussians if total_gaussians > 0 else 0.0
                     ),
+                    "experiment_seed": int(self.cfg.train.view_sample_seed),
                     **self.lifter.last_stats,
                 }
             )
@@ -735,9 +745,21 @@ class CLSplatsTrainer:
         if self.timestep > start_time and self.active_mask is not None and self._primitives:
             self._constraint_prune_step(iteration)
 
+        with torch.no_grad():
+            pred_bchw = rendered.detach().permute(2, 0, 1).unsqueeze(0).clamp(0, 1)
+            gt_bchw = gt.detach().permute(2, 0, 1).unsqueeze(0).clamp(0, 1)
+
+            psnr = float(_manual_psnr(pred_bchw, gt_bchw))
+            ssim = float(_manual_ssim(pred_bchw, gt_bchw))
+
         self._timestep_iter += 1
         self._global_step += 1
-        return {"loss": float(total_loss.detach().cpu())}
+
+        return {
+            "loss": float(total_loss.detach().cpu()),
+            "psnr": psnr,
+            "ssim": ssim,
+        }
 
     def _constraint_prune_step(self, iteration: int) -> None:
         """Prune *active* Gaussians that stay outside the fitted primitives.
@@ -809,7 +831,7 @@ class CLSplatsTrainer:
         else:
             self._primitives = []
 
-    def train(self) -> None:
+    def train(self, test_cameras=None) -> None:
         """Run the training loop for the current timestep."""
 
         if self.timestep == self.cfg.train.start_time:
@@ -820,6 +842,8 @@ class CLSplatsTrainer:
         log_interval = self.cfg.train.log_interval
 
         losses: list[float] = []
+        diagnostic_iterations = {1, 10, 50, 100, 500, 1000, 3000, 5000}
+        optimization_history: list[dict] = []
 
         gaussians_before_train = self.gaussians.num_gaussians
 
@@ -834,6 +858,19 @@ class CLSplatsTrainer:
             if self.cfg.diagnostics.enabled:
                 losses.append(stats["loss"])
 
+                current_iteration = it + 1
+
+                if current_iteration in diagnostic_iterations or current_iteration == num_iters:
+                    optimization_history.append(
+                        {
+                            "iteration": current_iteration,
+                            "loss": stats["loss"],
+                            "psnr": stats["psnr"],
+                            "ssim": stats["ssim"],
+                            "gaussian_count": self.gaussians.num_gaussians,
+                        }
+                    )
+
             if (it + 1) % log_interval == 0:
                 logger.info(
                     "[time={time} it={it}/{num_iters}] loss={loss:.4f}",
@@ -843,17 +880,64 @@ class CLSplatsTrainer:
                     loss=stats["loss"],
                 )
 
-        # 여기부터 12번 코드
         if self.cfg.diagnostics.enabled:
             self._sync_cuda()
-
             optimization_sec = time.perf_counter() - optimization_start
 
+        # Final evaluation on all training views
+        final_train_psnr_values: list[float] = []
+        final_train_ssim_values: list[float] = []
+
+        if self.cfg.diagnostics.enabled:
+            self._sync_cuda()
+            final_train_eval_start = time.perf_counter()
+
+            with torch.no_grad():
+                for eval_cam in self.train_cameras:
+                    eval_rendered = self._render_camera(eval_cam)
+
+                    eval_gt = eval_cam.original_image.permute(1, 2, 0).contiguous().to(self.device)
+
+                    if eval_cam.alpha_mask is not None:
+                        eval_alpha = (
+                            eval_cam.alpha_mask.permute(1, 2, 0).contiguous().to(self.device)
+                        )
+                        eval_rendered = eval_rendered * eval_alpha
+
+                    pred_bchw = eval_rendered.permute(2, 0, 1).unsqueeze(0).clamp(0, 1)
+                    gt_bchw = eval_gt.permute(2, 0, 1).unsqueeze(0).clamp(0, 1)
+
+                    final_train_psnr_values.append(float(_manual_psnr(pred_bchw, gt_bchw)))
+                    final_train_ssim_values.append(float(_manual_ssim(pred_bchw, gt_bchw)))
+
+        final_train_psnr = (
+            sum(final_train_psnr_values) / len(final_train_psnr_values)
+            if final_train_psnr_values
+            else None
+        )
+
+        final_train_ssim = (
+            sum(final_train_ssim_values) / len(final_train_ssim_values)
+            if final_train_ssim_values
+            else None
+        )
+
+        if self.cfg.diagnostics.enabled:
+            self._sync_cuda()
+            final_train_eval_sec = time.perf_counter() - final_train_eval_start
+
+        # 여기부터 12번 코드
+        if self.cfg.diagnostics.enabled:
             gaussians_after_train = self.gaussians.num_gaussians
 
             self._diagnostics.update(
                 {
                     "iterations": num_iters,
+                    "optimization_history": optimization_history,
+                    "final_train_psnr": final_train_psnr,
+                    "final_train_ssim": final_train_ssim,
+                    "final_train_eval_views": len(final_train_psnr_values),
+                    "final_train_eval_sec": final_train_eval_sec,
                     "gaussians_before_train": gaussians_before_train,
                     "gaussians_after_train": gaussians_after_train,
                     "gaussian_count_delta": (gaussians_after_train - gaussians_before_train),
@@ -880,6 +964,28 @@ class CLSplatsTrainer:
             and self.active_mask is not None
         ):
             self._history.end_timestep(self.active_mask)
+
+            # Final evaluation on fixed held-out test views
+        if self.cfg.diagnostics.enabled and test_cameras:
+            self._sync_cuda()
+            final_test_eval_start = time.perf_counter()
+
+            test_metrics = self.evaluate(
+                test_cameras=test_cameras,
+                timestep=self.timestep,
+            )
+
+            self._sync_cuda()
+            final_test_eval_sec = time.perf_counter() - final_test_eval_start
+
+            self._diagnostics.update(
+                {
+                    "final_test_psnr": test_metrics["psnr"],
+                    "final_test_ssim": test_metrics["ssim"],
+                    "final_test_eval_views": len(test_cameras),
+                    "final_test_eval_sec": final_test_eval_sec,
+                }
+            )
 
         # 마지막에 저장
         if self.cfg.diagnostics.enabled:
@@ -1031,11 +1137,19 @@ class CLSplatsTrainer:
         """Export Gaussians and log metrics."""
         # We export the point cloud to the current working directory, which
         # will typically be managed by Hydra's output directory system, or ./outputs
-        out_dir = Path("outputs")
+        out_dir = Path("outputs/ply")
         out_dir.mkdir(exist_ok=True, parents=True)
 
-        # Save a .ply file for the current timestep
-        ply_path = out_dir / f"gaussians_time_{self.timestep:04d}.ply"
+        # Save a .ply file using the same naming rule as diagnostics
+        num_views = len(self.train_cameras)
+
+        if self.timestep == self.cfg.train.start_time:
+            iterations = 30000
+        else:
+            iterations = self.cfg.train.iters_per_timestep
+
+        ply_path = out_dir / f"ply_{num_views}_{iterations}.ply"
+
         self.gaussians.export_ply(str(ply_path))
         logger.info("Exported optimized Gaussians to {path}", path=ply_path)
 

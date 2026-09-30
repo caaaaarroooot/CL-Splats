@@ -20,6 +20,76 @@ from clsplats.representation.cl_gaussians import CLGaussians
 from clsplats.utils.custom_types import Image
 
 
+def _align_relative_depth_with_stats(
+    mono: torch.Tensor,
+    rendered_depth: torch.Tensor,
+    change_mask: torch.Tensor,
+    min_pixels: int = 200,
+) -> tuple[Optional[torch.Tensor], dict]:
+    """Align relative monocular depth and return diagnostic statistics.
+
+    This helper preserves the original alignment algorithm while exposing
+    diagnostic information about alignment quality and failure reasons.
+    """
+    valid = (
+        (~change_mask)
+        & (rendered_depth > 1e-6)
+        & torch.isfinite(rendered_depth)
+        & torch.isfinite(mono)
+    )
+
+    anchor_pixels = int(valid.sum().item())
+
+    stats = {
+        "success": False,
+        "failure_reason": None,
+        "anchor_pixels": anchor_pixels,
+        "r2": None,
+        "scale_a": None,
+        "offset_b": None,
+    }
+
+    if anchor_pixels < min_pixels:
+        stats["failure_reason"] = "insufficient_anchor_pixels"
+        return None, stats
+
+    x = mono[valid].float()
+    y = 1.0 / rendered_depth[valid].float()
+
+    ones = torch.ones_like(x)
+    A = torch.stack([x, ones], dim=-1)
+
+    solution = torch.linalg.lstsq(
+        A,
+        y.unsqueeze(-1),
+    ).solution.squeeze(-1)
+
+    a = float(solution[0].item())
+    b = float(solution[1].item())
+
+    stats["scale_a"] = a
+    stats["offset_b"] = b
+
+    prediction = a * x + b
+
+    ss_res = ((prediction - y) ** 2).sum()
+    ss_tot = ((y - y.mean()) ** 2).sum().clamp_min(1e-12)
+
+    r2 = float((1.0 - ss_res / ss_tot).item())
+    stats["r2"] = r2
+
+    if r2 < 0.3:
+        stats["failure_reason"] = "low_r2"
+        return None, stats
+
+    disparity = (a * mono + b).clamp_min(1e-6)
+    aligned_depth = 1.0 / disparity
+
+    stats["success"] = True
+
+    return aligned_depth, stats
+
+
 def align_relative_depth(
     mono: torch.Tensor,
     rendered_depth: torch.Tensor,
@@ -28,35 +98,18 @@ def align_relative_depth(
 ) -> Optional[torch.Tensor]:
     """Anchor relative monocular depth to the scene's metric scale.
 
-    Depth-Anything (like MiDaS) predicts affine-invariant *disparity*. Fit
-    ``1/z ≈ a * mono + b`` by least squares over pixels that are unchanged
-    (the existing model is valid there) and covered by the render, then
-    return the metric depth ``1 / (a * mono + b)`` for the whole image.
-
-    Returns None when the fit is unusable (too few anchor pixels or a
-    non-positive scale).
+    This public wrapper preserves the original API used by existing code
+    and tests. Diagnostic callers should use
+    ``_align_relative_depth_with_stats`` instead.
     """
-    valid = (~change_mask) & (rendered_depth > 1e-6) & torch.isfinite(mono)
-    if int(valid.sum()) < min_pixels:
-        return None
+    aligned_depth, _ = _align_relative_depth_with_stats(
+        mono=mono,
+        rendered_depth=rendered_depth,
+        change_mask=change_mask,
+        min_pixels=min_pixels,
+    )
 
-    x = mono[valid].float()
-    y = 1.0 / rendered_depth[valid].float()  # target disparity
-    ones = torch.ones_like(x)
-    A = torch.stack([x, ones], dim=-1)  # [M, 2]
-    solution = torch.linalg.lstsq(A, y.unsqueeze(-1)).solution.squeeze(-1)
-    a, b = float(solution[0]), float(solution[1])
-
-    # Reject fits where the mono signal doesn't explain the anchor
-    # disparities (R² in disparity space) — a degenerate prediction
-    # collapses to the constant fit with R² ≈ 0.
-    ss_res = ((a * x + b - y) ** 2).sum()
-    ss_tot = ((y - y.mean()) ** 2).sum().clamp_min(1e-12)
-    if float(1.0 - ss_res / ss_tot) < 0.3:
-        return None
-
-    disparity = (a * mono + b).clamp_min(1e-6)
-    return 1.0 / disparity
+    return aligned_depth
 
 
 class DepthAnythingLifter(BaseLifter):
@@ -83,12 +136,12 @@ class DepthAnythingLifter(BaseLifter):
         self.min_positive_ratio = lcfg.min_positive_ratio
         self.final_thresh = lcfg.final_thresh
         self.diagnostics_enabled = cfg.diagnostics.enabled
-        self.last_stats: dict[str, float | int] = {}
-        
+        self.last_stats: dict[str, object] = {}
+
     def _sync_cuda(self) -> None:
         if self.diagnostics_enabled and torch.cuda.is_available():
             torch.cuda.synchronize()
-        
+
     @torch.no_grad()
     def estimate_depth(self, observation: Image) -> torch.Tensor:
         """Estimate depth from an observation image ``[H, W, 3]`` in ``[0, 1]``.
@@ -149,7 +202,15 @@ class DepthAnythingLifter(BaseLifter):
         scales = gaussians.params.scales  # (N, 3)
 
         skipped_views = 0
+        alignment_per_view = []
+        lifting_per_view = []
+
         for view_id, (cam, mask) in enumerate(zip(cameras, change_masks)):
+            positive_pixels_total = 0
+            positive_pixels_sampled = 0
+            radius_candidates = 0
+            radius_passed = 0
+            depth_passed = 0
             obs = cam.original_image.permute(1, 2, 0).contiguous()
 
             if self.diagnostics_enabled:
@@ -173,7 +234,7 @@ class DepthAnythingLifter(BaseLifter):
                     self._sync_cuda()
                     alignment_start = time.perf_counter()
 
-                aligned = align_relative_depth(
+                aligned, alignment_stats = _align_relative_depth_with_stats(
                     mono=depth,
                     rendered_depth=rendered_depths[view_id].to(device),
                     change_mask=mask > 0.5,
@@ -181,8 +242,14 @@ class DepthAnythingLifter(BaseLifter):
 
                 if self.diagnostics_enabled:
                     self._sync_cuda()
-                    depth_alignment_sec += (
-                        time.perf_counter() - alignment_start
+                    depth_alignment_sec += time.perf_counter() - alignment_start
+
+                    alignment_per_view.append(
+                        {
+                            "view_id": view_id,
+                            "image_name": cam.image_name,
+                            **alignment_stats,
+                        }
                     )
 
                 if aligned is None:
@@ -195,6 +262,8 @@ class DepthAnythingLifter(BaseLifter):
 
             # --- Positive pixels (changed) ---
             pos_pixels = (mask > 0.5) & torch.isfinite(depth) & (depth > 0)
+            positive_pixels_total = int(pos_pixels.sum().item())
+
             if pos_pixels.any():
                 ys, xs = torch.nonzero(pos_pixels, as_tuple=True)
                 # Sub-sample to avoid OOM in the kNN distance matrix (M×N).
@@ -203,6 +272,8 @@ class DepthAnythingLifter(BaseLifter):
                     perm = torch.randperm(ys.numel(), device=device)[:max_pos]
                     ys = ys[perm]
                     xs = xs[perm]
+
+                positive_pixels_sampled = int(ys.numel())
                 d = depth[ys, xs]
 
                 # Back-project to camera coordinates
@@ -229,6 +300,9 @@ class DepthAnythingLifter(BaseLifter):
                 d_local = knn_dists / denom
 
                 valid = d_local < self.local_radius_thresh  # [M, k]
+
+                radius_candidates = int(valid.numel())
+                radius_passed = int(valid.sum().item())
                 if valid.any():
                     # Depth consistency: project only the k neighbour means (not all N)
                     # into camera space — (M, k, 4) instead of (M, N, 4).
@@ -247,6 +321,9 @@ class DepthAnythingLifter(BaseLifter):
                     )
 
                     valid_final = valid & depth_ok  # [M, k]
+
+                    depth_passed = int(valid_final.sum().item())
+
                     if valid_final.any():
                         d_local_valid = d_local.masked_fill(~valid_final, 1e9)
                         weights = torch.exp(-0.5 * d_local_valid**2)
@@ -324,6 +401,18 @@ class DepthAnythingLifter(BaseLifter):
                     affected_n = torch.unique(flat_idx_n)
                     visible_views[affected_n] += 1
 
+            lifting_per_view.append(
+                {
+                    "view_id": view_id,
+                    "image_name": cam.image_name,
+                    "positive_pixels_total": positive_pixels_total,
+                    "positive_pixels_sampled": positive_pixels_sampled,
+                    "radius_candidates": radius_candidates,
+                    "radius_passed": radius_passed,
+                    "depth_passed": depth_passed,
+                }
+            )
+
         if skipped_views:
             logger.warning(
                 "Depth alignment failed for {n}/{total} views (skipped).",
@@ -339,15 +428,35 @@ class DepthAnythingLifter(BaseLifter):
         score = pos / (pos + neg + 1e-8)
 
         # Multi-view consistency filtering
-        keep = (
-            (visible_views >= self.min_visible_views)
-            & (positive_views >= self.min_positive_views)
-            & (seed_views >= self.min_seed_views)
-            & (positive_views.float() / (visible_views.float() + 1e-8) >= self.min_positive_ratio)
-        )
+        visible_ok = visible_views >= self.min_visible_views
+        positive_ok = positive_views >= self.min_positive_views
+        seed_ok = seed_views >= self.min_seed_views
+
+        positive_ratio = positive_views.float() / (visible_views.float() + 1e-8)
+        ratio_ok = positive_ratio >= self.min_positive_ratio
+
+        keep = visible_ok & positive_ok & seed_ok & ratio_ok
+
+        visible_passed = int(visible_ok.sum().item())
+        visible_failed = int((~visible_ok).sum().item())
+
+        positive_passed = int(positive_ok.sum().item())
+        positive_failed = int((~positive_ok).sum().item())
+
+        seed_passed = int(seed_ok.sum().item())
+        seed_failed = int((~seed_ok).sum().item())
+
+        ratio_passed = int(ratio_ok.sum().item())
+        ratio_failed = int((~ratio_ok).sum().item())
+
+        multiview_passed = int(keep.sum().item())
+        multiview_failed = int((~keep).sum().item())
         score = torch.where(keep, score, torch.zeros_like(score))
 
         changed_gaussians = score > self.final_thresh
+
+        final_score_passed = int(changed_gaussians.sum().item())
+        final_score_failed = int(multiview_passed - final_score_passed)
 
         if self.diagnostics_enabled:
             self._sync_cuda()
@@ -363,10 +472,28 @@ class DepthAnythingLifter(BaseLifter):
                 "lifting_total_sec": lifting_total_sec,
                 "lifting_other_sec": max(
                     0.0,
-                    lifting_total_sec
-                    - depth_estimation_sec
-                    - depth_alignment_sec,
+                    lifting_total_sec - depth_estimation_sec - depth_alignment_sec,
                 ),
+                "depth_alignment_per_view": alignment_per_view,
+                "lifting_per_view": lifting_per_view,
+                "multiview_filter": {
+                    "total_gaussians": N,
+                    "visible_passed": visible_passed,
+                    "visible_failed": visible_failed,
+                    "positive_passed": positive_passed,
+                    "positive_failed": positive_failed,
+                    "seed_passed": seed_passed,
+                    "seed_failed": seed_failed,
+                    "ratio_passed": ratio_passed,
+                    "ratio_failed": ratio_failed,
+                    "multiview_passed": multiview_passed,
+                    "multiview_failed": multiview_failed,
+                },
+                "final_score_filter": {
+                    "threshold": self.final_thresh,
+                    "passed": final_score_passed,
+                    "failed": final_score_failed,
+                },
             }
 
         return changed_gaussians

@@ -150,14 +150,10 @@ def main(
         detected = len(set(c.timestep for c in scene.train_cameras))
         if detected > 1 and num_times == 1:
             num_times = detected
-            logger.info(
-                "Auto-detected {n} timesteps from image names.", n=num_times
-            )
+            logger.info("Auto-detected {n} timesteps from image names.", n=num_times)
     elif fmt == "Blender" and change_type and num_times == 1:
         num_times = 2
-        logger.info(
-            "Set num_times=2 for Blender change type '{ct}'.", ct=change_type
-        )
+        logger.info("Set num_times=2 for Blender change type '{ct}'.", ct=change_type)
 
     # Keep the config in sync so trainer.prepare_timestep's assert passes.
     omegaconf.OmegaConf.update(cfg, "train.num_times", num_times, merge=False)
@@ -165,30 +161,18 @@ def main(
     # Track the last loaded scene so we can pass its test cameras to evaluate().
     active_scene = scene
 
-    baseline_ply = (
-        Path(cfg.model.pretrained_ply)
-        if cfg.model.pretrained_ply
-        else None
-    )
+    baseline_ply = Path(cfg.model.pretrained_ply) if cfg.model.pretrained_ply else None
 
     for time in range(cfg.train.start_time, num_times):
         # Pretrained 3DGS already represents t0, so skip initial optimisation.
-        if (
-            time == cfg.train.start_time
-            and baseline_ply is not None
-            and baseline_ply.is_file()
-        ):
-            logger.info(
-                "Skipping t0 optimisation because pretrained PLY is loaded."
-            )
+        if time == cfg.train.start_time and baseline_ply is not None and baseline_ply.is_file():
+            logger.info("Skipping t0 optimisation because pretrained PLY is loaded.")
             continue
         # For Blender temporal data: load the change-scene at t1
         if fmt == "Blender" and time > cfg.train.start_time and change_type:
             change_path = os.path.join(cfg.data_path, change_type)
             if not os.path.isdir(change_path):
-                logger.error(
-                    "Change directory '{path}' not found.", path=change_path
-                )
+                logger.error("Change directory '{path}' not found.", path=change_path)
                 raise SystemExit(1)
             change_scene = readNerfSyntheticInfo(
                 path=change_path,
@@ -200,13 +184,12 @@ def main(
 
         logger.info("Optimizing observations at time {time}.", time=time)
         trainer.prepare_timestep(time)
-        trainer.train()
 
-        if cfg.eval and active_scene.test_cameras:
-            trainer.evaluate(
-                test_cameras=active_scene.test_cameras,
-                timestep=time,
+        trainer.train(
+            test_cameras=(
+                active_scene.test_cameras if cfg.eval and active_scene.test_cameras else None
             )
+        )
 
         if cfg.history.log_history:
             trainer.log_history()

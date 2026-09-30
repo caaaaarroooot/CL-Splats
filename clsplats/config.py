@@ -21,7 +21,8 @@ class ModelConfig:
     # Existing trained 3DGS checkpoint (.ply).
     # Empty string means: initialize from scene.point_cloud as before.
     pretrained_ply: str = ""
-    
+
+
 @dataclass
 class TrainConfig:
     """Training loop settings."""
@@ -102,12 +103,14 @@ class HistoryConfig:
 
     log_history: bool = False
 
+
 @dataclass
 class DiagnosticsConfig:
     """Diagnostic logging settings."""
 
     enabled: bool = False
     out_dir: str = "outputs/diagnostics"
+
 
 @dataclass
 class CLSplatsConfig:
