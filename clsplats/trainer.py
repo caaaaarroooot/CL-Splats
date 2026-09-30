@@ -291,9 +291,14 @@ class CLSplatsTrainer:
             )
         )
 
-        run_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        num_views = int(
+            self._diagnostics.get(
+                "num_views",
+                len(self.train_cameras),
+            )
+        )
 
-        json_path = out_dir / (f"diagnostic_t{timestep:04d}_iter_{iterations}_{run_id}.json")
+        json_path = out_dir / (f"diag_{num_views}_{iterations}.json")
 
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(
