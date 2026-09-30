@@ -10,7 +10,7 @@ import time
 from datetime import datetime
 from collections import defaultdict
 from pathlib import Path
-from random import randint
+from random import Random, randint
 from typing import TYPE_CHECKING, List
 
 import numpy as np
@@ -37,6 +37,7 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 # Metric helpers (used when torchmetrics is not installed)
 # ---------------------------------------------------------------------------
+
 
 def _manual_psnr(pred: torch.Tensor, gt: torch.Tensor, max_val: float = 1.0) -> torch.Tensor:
     """Peak Signal-to-Noise Ratio for [B, C, H, W] tensors in [0, max_val]."""
@@ -140,43 +141,38 @@ _DIAGNOSTIC_FIELDS = [
     "timestep",
     "iterations",
     "num_views",
-
+    "available_change_views",
+    "requested_change_views",
+    "view_sample_seed",
+    "selected_views",
     "gaussians_before_prepare",
-
     "render_sec",
     "dino_sec",
-
     "change_mask_mean_ratio",
     "change_mask_min_ratio",
     "change_mask_max_ratio",
-
     "total_views",
     "valid_views",
     "skipped_views",
-
     "depth_estimation_sec",
     "depth_alignment_sec",
     "lifting_other_sec",
     "lifting_total_sec",
-
     "active_gaussians",
     "active_gaussian_ratio",
-
     "prepare_sec",
-
     "gaussians_before_train",
     "gaussians_after_train",
     "gaussian_count_delta",
-
     "loss_first",
     "loss_last",
     "loss_mean",
     "loss_min",
     "loss_max",
-
     "optimization_sec",
     "total_update_sec",
 ]
+
 
 class CLSplatsTrainer:
     """Minimal gsplat-backed trainer for continual-learning scene editing.
@@ -203,6 +199,8 @@ class CLSplatsTrainer:
         self._history = HistoryRecorder()
         self._diagnostics: dict[str, object] = {}
         self._diagnostic_update_start: float | None = None
+        self._selected_change_views: list[str] = []
+        self._available_change_views: int = 0
 
         # 1) Initialise Gaussians from scene point cloud
         pcd = scene.point_cloud
@@ -229,12 +227,8 @@ class CLSplatsTrainer:
         )
         # 3DGS scales the position learning rate by the camera extent.
         self.gaussians = CLGaussians(cfg, params, spatial_lr_scale=self.scene_extent)
-        
-        baseline_ply = (
-            Path(cfg.model.pretrained_ply)
-            if cfg.model.pretrained_ply
-            else None
-        )
+
+        baseline_ply = Path(cfg.model.pretrained_ply) if cfg.model.pretrained_ply else None
 
         if baseline_ply is not None and baseline_ply.is_file():
             logger.info(
@@ -258,7 +252,7 @@ class CLSplatsTrainer:
                 params,
                 spatial_lr_scale=self.scene_extent,
             )
-        
+
         self.gaussians.initialize_strategy_state(self.scene_extent)
 
         # 2) Cameras and change detector
@@ -276,27 +270,19 @@ class CLSplatsTrainer:
 
         self.detector = DinoV2Detector(cfg.change)
         self.lifter = DepthAnythingLifter(cfg)
-        
+
     def _sync_cuda(self) -> None:
-        if (
-            self.cfg.diagnostics.enabled
-            and self.device.type == "cuda"
-        ):
+        if self.cfg.diagnostics.enabled and self.device.type == "cuda":
             torch.cuda.synchronize()
 
     def _save_diagnostics(self) -> None:
-        if (
-            not self.cfg.diagnostics.enabled
-            or not self._diagnostics
-        ):
+        if not self.cfg.diagnostics.enabled or not self._diagnostics:
             return
 
         out_dir = Path(self.cfg.diagnostics.out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        timestep = int(
-            self._diagnostics.get("timestep", self.timestep)
-        )
+        timestep = int(self._diagnostics.get("timestep", self.timestep))
 
         iterations = int(
             self._diagnostics.get(
@@ -305,15 +291,9 @@ class CLSplatsTrainer:
             )
         )
 
-        run_id = datetime.now().strftime(
-            "%Y%m%d_%H%M%S_%f"
-        )
+        run_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
 
-        json_path = out_dir / (
-            f"diagnostic_t{timestep:04d}"
-            f"_iter_{iterations}"
-            f"_{run_id}.json"
-        )
+        json_path = out_dir / (f"diagnostic_t{timestep:04d}_iter_{iterations}_{run_id}.json")
 
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(
@@ -326,10 +306,7 @@ class CLSplatsTrainer:
         csv_path = out_dir / "summary.csv"
         write_header = not csv_path.exists()
 
-        row = {
-            field: self._diagnostics.get(field, "")
-            for field in _DIAGNOSTIC_FIELDS
-        }
+        row = {field: self._diagnostics.get(field, "") for field in _DIAGNOSTIC_FIELDS}
 
         with open(
             csv_path,
@@ -396,12 +373,58 @@ class CLSplatsTrainer:
     def update_cameras(self, scene: SceneInfo, timestep: int) -> None:
         """Load new cameras from *scene* for the given *timestep*.
 
-        Used for the Blender/NeRF-Synthetic temporal workflow where each
-        timestep lives in a separate directory.
+        Optionally subsamples the change-scene views.  A value of
+        ``train.num_change_views == 0`` keeps all available views.
         """
         self._is_nerf_synthetic = bool(scene.is_nerf_synthetic)
+
+        cam_infos = list(scene.train_cameras)
+        total_views = len(cam_infos)
+
+        self._available_change_views = total_views
+
+        requested_views = self.cfg.train.num_change_views
+
+        if requested_views < 0:
+            raise ValueError(
+                "train.num_change_views must be >= 0 (0 means use all available views)."
+            )
+
+        if requested_views > total_views:
+            raise ValueError(
+                f"Requested {requested_views} change views, but only {total_views} are available."
+            )
+
+        # 0 or exactly all available views -> no subsampling.
+        if 0 < requested_views < total_views:
+            rng = Random(self.cfg.train.view_sample_seed)
+
+            # Sample indices, then sort them so the selected subset keeps
+            # the original dataset ordering.
+            selected_indices = sorted(
+                rng.sample(
+                    range(total_views),
+                    requested_views,
+                )
+            )
+
+            cam_infos = [cam_infos[i] for i in selected_indices]
+
+            logger.info(
+                "Randomly selected {selected}/{total} change views (seed={seed}).",
+                selected=len(cam_infos),
+                total=total_views,
+                seed=self.cfg.train.view_sample_seed,
+            )
+        else:
+            logger.info(
+                "Using all {total} available change views.",
+                total=total_views,
+            )
+
         new_cameras: list[Camera] = []
-        for uid, cam_info in enumerate(scene.train_cameras):
+
+        for uid, cam_info in enumerate(cam_infos):
             new_cameras.append(
                 self._camera_from_info(
                     cam_info,
@@ -410,6 +433,9 @@ class CLSplatsTrainer:
                     timestep=timestep,
                 )
             )
+
+        self._selected_change_views = [cam.image_name for cam in new_cameras]
+
         self._cameras_by_timestep[timestep] = new_cameras
 
     def prepare_timestep(self, timestep: int) -> None:
@@ -434,31 +460,24 @@ class CLSplatsTrainer:
 
         start_time = self.cfg.train.start_time
         is_initial = timestep == start_time
-        
+
         if self.cfg.diagnostics.enabled:
             self._sync_cuda()
 
-            self._diagnostic_update_start = (
-                time.perf_counter()
-            )
+            self._diagnostic_update_start = time.perf_counter()
 
             self._diagnostics = {
-                "timestamp": datetime.now().isoformat(
-                    timespec="seconds"
-                ),
-                "phase": (
-                    "initial"
-                    if is_initial
-                    else "continual"
-                ),
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                "phase": ("initial" if is_initial else "continual"),
                 "data_path": self.cfg.data_path,
-                "pretrained_ply": (
-                    self.cfg.model.pretrained_ply
-                ),
+                "pretrained_ply": (self.cfg.model.pretrained_ply),
                 "timestep": timestep,
                 "num_views": len(self.train_cameras),
-                "gaussians_before_prepare":
-                    self.gaussians.num_gaussians,
+                "available_change_views": self._available_change_views,
+                "requested_change_views": self.cfg.train.num_change_views,
+                "view_sample_seed": self.cfg.train.view_sample_seed,
+                "selected_views": self._selected_change_views,
+                "gaussians_before_prepare": self.gaussians.num_gaussians,
             }
 
         # Fresh strategy + state per timestep: the densification window is
@@ -490,60 +509,39 @@ class CLSplatsTrainer:
 
         for cam in self.train_cameras:
             with torch.no_grad():
-
                 # ---------- Existing GS render ----------
                 if self.cfg.diagnostics.enabled:
                     self._sync_cuda()
                     render_start = time.perf_counter()
 
-                rendered, rendered_depth = (
-                    self._render_camera(
-                        cam,
-                        return_depth=True,
-                    )
+                rendered, rendered_depth = self._render_camera(
+                    cam,
+                    return_depth=True,
                 )
 
                 if self.cfg.diagnostics.enabled:
                     self._sync_cuda()
-                    render_sec += (
-                        time.perf_counter()
-                        - render_start
-                    )
+                    render_sec += time.perf_counter() - render_start
 
                 # ---------- DINO change detection ----------
                 if self.cfg.diagnostics.enabled:
                     self._sync_cuda()
                     dino_start = time.perf_counter()
 
-                change_mask_2d = (
-                    self.detector.predict_change_mask(
-                        rendered_image=rendered,
-                        observation=(
-                            cam.original_image
-                            .permute(1, 2, 0)
-                            .contiguous()
-                            .to(self.device)
-                        ),
-                    )
+                change_mask_2d = self.detector.predict_change_mask(
+                    rendered_image=rendered,
+                    observation=(cam.original_image.permute(1, 2, 0).contiguous().to(self.device)),
                 )
 
                 if self.cfg.diagnostics.enabled:
                     self._sync_cuda()
-                    dino_sec += (
-                        time.perf_counter()
-                        - dino_start
-                    )
+                    dino_sec += time.perf_counter() - dino_start
 
             change_masks.append(change_mask_2d)
             rendered_depths.append(rendered_depth)
 
             if self.cfg.diagnostics.enabled:
-                ratio = float(
-                    (change_mask_2d > 0.5)
-                    .float()
-                    .mean()
-                    .item()
-                )
+                ratio = float((change_mask_2d > 0.5).float().mean().item())
                 change_ratios.append(ratio)
 
         self.active_mask = self.lifter.lift(
@@ -552,49 +550,28 @@ class CLSplatsTrainer:
             change_masks=change_masks,
             rendered_depths=rendered_depths,
         )
-        
+
         if self.cfg.diagnostics.enabled:
-            total_gaussians = (
-                self.gaussians.num_gaussians
+            total_gaussians = self.gaussians.num_gaussians
+
+            active_gaussians = int(self.active_mask.sum().item())
+
+            self._diagnostics.update(
+                {
+                    "render_sec": render_sec,
+                    "dino_sec": dino_sec,
+                    "change_mask_mean_ratio": (
+                        sum(change_ratios) / len(change_ratios) if change_ratios else 0.0
+                    ),
+                    "change_mask_min_ratio": (min(change_ratios) if change_ratios else 0.0),
+                    "change_mask_max_ratio": (max(change_ratios) if change_ratios else 0.0),
+                    "active_gaussians": active_gaussians,
+                    "active_gaussian_ratio": (
+                        active_gaussians / total_gaussians if total_gaussians > 0 else 0.0
+                    ),
+                    **self.lifter.last_stats,
+                }
             )
-
-            active_gaussians = int(
-                self.active_mask.sum().item()
-            )
-
-            self._diagnostics.update({
-                "render_sec": render_sec,
-                "dino_sec": dino_sec,
-
-                "change_mask_mean_ratio": (
-                    sum(change_ratios)
-                    / len(change_ratios)
-                    if change_ratios
-                    else 0.0
-                ),
-                "change_mask_min_ratio": (
-                    min(change_ratios)
-                    if change_ratios
-                    else 0.0
-                ),
-                "change_mask_max_ratio": (
-                    max(change_ratios)
-                    if change_ratios
-                    else 0.0
-                ),
-
-                "active_gaussians":
-                    active_gaussians,
-
-                "active_gaussian_ratio": (
-                    active_gaussians
-                    / total_gaussians
-                    if total_gaussians > 0
-                    else 0.0
-                ),
-
-                **self.lifter.last_stats,
-            })
 
         # Inactive Gaussians must stay exactly frozen: zero their Adam
         # moments so leftover momentum from earlier timesteps cannot move
@@ -605,9 +582,7 @@ class CLSplatsTrainer:
         # the end-of-timestep active mask this is the complete delta needed
         # to recover the previous scene state exactly.
         if self.cfg.history.log_history and self.active_mask is not None:
-            self._history.begin_timestep(
-                timestep, self.active_mask, self.gaussians.strategy_params
-            )
+            self._history.begin_timestep(timestep, self.active_mask, self.gaussians.strategy_params)
 
         # Fit geometric primitives around active Gaussians
         if self.active_mask is not None and self.active_mask.any():
@@ -621,18 +596,11 @@ class CLSplatsTrainer:
             ]
         else:
             self._primitives = []
-            
-        if (
-            self.cfg.diagnostics.enabled
-            and self._diagnostic_update_start
-            is not None
-        ):
+
+        if self.cfg.diagnostics.enabled and self._diagnostic_update_start is not None:
             self._sync_cuda()
 
-            self._diagnostics["prepare_sec"] = (
-                time.perf_counter()
-                - self._diagnostic_update_start
-            )
+            self._diagnostics["prepare_sec"] = time.perf_counter() - self._diagnostic_update_start
 
     def _render_camera(self, cam: Camera, return_info: bool = False, return_depth: bool = False):
         """Render a single camera view using gsplat rasterisation.
@@ -759,11 +727,7 @@ class CLSplatsTrainer:
         self._sync_after_strategy(old_count)
 
         # Hard pruning with hysteresis
-        if (
-            self.timestep > start_time
-            and self.active_mask is not None
-            and self._primitives
-        ):
+        if self.timestep > start_time and self.active_mask is not None and self._primitives:
             self._constraint_prune_step(iteration)
 
         self._timestep_iter += 1
@@ -790,9 +754,7 @@ class CLSplatsTrainer:
         # Recompute on the current Gaussians — the strategy may have
         # changed the count since the loss-time distance was taken.
         with torch.no_grad():
-            d_union_now = union_distance(
-                self.gaussians.params.positions.detach(), self._primitives
-            )
+            d_union_now = union_distance(self.gaussians.params.positions.detach(), self._primitives)
         active = self.active_mask.to(self.device)
         outside = (d_union_now > prune_dist) & active
         self._outside_counts[outside] += 1
@@ -854,9 +816,7 @@ class CLSplatsTrainer:
 
         losses: list[float] = []
 
-        gaussians_before_train = (
-            self.gaussians.num_gaussians
-        )
+        gaussians_before_train = self.gaussians.num_gaussians
 
         if self.cfg.diagnostics.enabled:
             self._sync_cuda()
@@ -882,60 +842,28 @@ class CLSplatsTrainer:
         if self.cfg.diagnostics.enabled:
             self._sync_cuda()
 
-            optimization_sec = (
-                time.perf_counter()
-                - optimization_start
+            optimization_sec = time.perf_counter() - optimization_start
+
+            gaussians_after_train = self.gaussians.num_gaussians
+
+            self._diagnostics.update(
+                {
+                    "iterations": num_iters,
+                    "gaussians_before_train": gaussians_before_train,
+                    "gaussians_after_train": gaussians_after_train,
+                    "gaussian_count_delta": (gaussians_after_train - gaussians_before_train),
+                    "loss_first": losses[0] if losses else None,
+                    "loss_last": losses[-1] if losses else None,
+                    "loss_mean": (sum(losses) / len(losses) if losses else None),
+                    "loss_min": min(losses) if losses else None,
+                    "loss_max": max(losses) if losses else None,
+                    "optimization_sec": optimization_sec,
+                }
             )
 
-            gaussians_after_train = (
-                self.gaussians.num_gaussians
-            )
-
-            self._diagnostics.update({
-                "iterations": num_iters,
-
-                "gaussians_before_train":
-                    gaussians_before_train,
-
-                "gaussians_after_train":
-                    gaussians_after_train,
-
-                "gaussian_count_delta": (
-                    gaussians_after_train
-                    - gaussians_before_train
-                ),
-
-                "loss_first":
-                    losses[0] if losses else None,
-
-                "loss_last":
-                    losses[-1] if losses else None,
-
-                "loss_mean": (
-                    sum(losses) / len(losses)
-                    if losses
-                    else None
-                ),
-
-                "loss_min":
-                    min(losses) if losses else None,
-
-                "loss_max":
-                    max(losses) if losses else None,
-
-                "optimization_sec":
-                    optimization_sec,
-            })
-
-            if (
-                self._diagnostic_update_start
-                is not None
-            ):
-                self._diagnostics[
-                    "total_update_sec"
-                ] = (
-                    time.perf_counter()
-                    - self._diagnostic_update_start
+            if self._diagnostic_update_start is not None:
+                self._diagnostics["total_update_sec"] = (
+                    time.perf_counter() - self._diagnostic_update_start
                 )
 
         # 기존 history 코드
@@ -946,13 +874,12 @@ class CLSplatsTrainer:
             and self._history.records[-1].active_end_mask is None
             and self.active_mask is not None
         ):
-            self._history.end_timestep(
-                self.active_mask
-            )
+            self._history.end_timestep(self.active_mask)
 
         # 마지막에 저장
         if self.cfg.diagnostics.enabled:
             self._save_diagnostics()
+
     # ------------------------------------------------------------------
     # Evaluation
     # ------------------------------------------------------------------
@@ -989,15 +916,12 @@ class CLSplatsTrainer:
                 PeakSignalNoiseRatio,
                 StructuralSimilarityIndexMeasure,
             )
+
             psnr_metric = PeakSignalNoiseRatio(data_range=1.0).to(self.device)
-            ssim_metric = StructuralSimilarityIndexMeasure(
-                data_range=1.0
-            ).to(self.device)
+            ssim_metric = StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
             use_torchmetrics = True
         except ImportError:
-            logger.warning(
-                "torchmetrics not installed — using manual PSNR/SSIM fallbacks."
-            )
+            logger.warning("torchmetrics not installed — using manual PSNR/SSIM fallbacks.")
             use_torchmetrics = False
 
         psnr_values: list[float] = []
@@ -1057,23 +981,16 @@ class CLSplatsTrainer:
             )
 
             # Save rendered and ground-truth images
-            rendered_np = (
-                rendered.detach().cpu().clamp(0, 1).numpy() * 255
-            ).astype("uint8")
+            rendered_np = (rendered.detach().cpu().clamp(0, 1).numpy() * 255).astype("uint8")
             gt_np = (gt.detach().cpu().clamp(0, 1).numpy() * 255).astype("uint8")
-            PILImage.fromarray(rendered_np).save(
-                out_dir / f"{cam_info.image_name}_render.png"
-            )
-            PILImage.fromarray(gt_np).save(
-                out_dir / f"{cam_info.image_name}_gt.png"
-            )
+            PILImage.fromarray(rendered_np).save(out_dir / f"{cam_info.image_name}_render.png")
+            PILImage.fromarray(gt_np).save(out_dir / f"{cam_info.image_name}_gt.png")
 
         mean_psnr = float(sum(psnr_values) / len(psnr_values)) if psnr_values else 0.0
         mean_ssim = float(sum(ssim_values) / len(ssim_values)) if ssim_values else 0.0
 
         logger.info(
-            "[eval t={t}] Mean PSNR={psnr:.2f} dB  Mean SSIM={ssim:.4f}  "
-            "({n} views)  → {dir}",
+            "[eval t={t}] Mean PSNR={psnr:.2f} dB  Mean SSIM={ssim:.4f}  ({n} views)  → {dir}",
             t=timestep,
             psnr=mean_psnr,
             ssim=mean_ssim,
@@ -1084,11 +1001,14 @@ class CLSplatsTrainer:
         # W&B logging
         try:
             import wandb
+
             if wandb.run is not None:
-                wandb.log({
-                    f"eval/t{timestep}/psnr": mean_psnr,
-                    f"eval/t{timestep}/ssim": mean_ssim,
-                })
+                wandb.log(
+                    {
+                        f"eval/t{timestep}/psnr": mean_psnr,
+                        f"eval/t{timestep}/ssim": mean_ssim,
+                    }
+                )
                 # Log a grid of up to 8 renders
                 panels = []
                 for cam_info in test_cameras[:8]:

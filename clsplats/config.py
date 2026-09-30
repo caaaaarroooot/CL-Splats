@@ -49,6 +49,12 @@ class TrainConfig:
     log_interval: int = 10
     num_times: int = 1
     start_time: int = 0
+    # Number of change-scene views used from t1 onward.
+    # 0 means use all available views.
+    num_change_views: int = 0
+
+    # Fixed seed for reproducible random view subsampling.
+    view_sample_seed: int = 42
 
 
 @dataclass
