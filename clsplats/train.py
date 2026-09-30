@@ -165,11 +165,19 @@ def main(
     # Track the last loaded scene so we can pass its test cameras to evaluate().
     active_scene = scene
 
-    for time in range(cfg.train.start_time, num_times):
-        baseline_ply = Path("outputs/gaussians_time_30000.ply")
+    baseline_ply = (
+        Path(cfg.model.pretrained_ply)
+        if cfg.model.pretrained_ply
+        else None
+    )
 
+    for time in range(cfg.train.start_time, num_times):
         # Pretrained 3DGS already represents t0, so skip initial optimisation.
-        if time == 0 and baseline_ply.exists():
+        if (
+            time == cfg.train.start_time
+            and baseline_ply is not None
+            and baseline_ply.is_file()
+        ):
             logger.info(
                 "Skipping t0 optimisation because pretrained PLY is loaded."
             )

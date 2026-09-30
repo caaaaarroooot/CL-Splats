@@ -178,9 +178,13 @@ class CLSplatsTrainer:
         # 3DGS scales the position learning rate by the camera extent.
         self.gaussians = CLGaussians(cfg, params, spatial_lr_scale=self.scene_extent)
         
-        baseline_ply = Path("outputs/gaussians_time_30000.ply")
+        baseline_ply = (
+            Path(cfg.model.pretrained_ply)
+            if cfg.model.pretrained_ply
+            else None
+        )
 
-        if baseline_ply.exists():
+        if baseline_ply is not None and baseline_ply.is_file():
             logger.info(
                 "Using pretrained 30000-iteration 3DGS: {path}",
                 path=baseline_ply,

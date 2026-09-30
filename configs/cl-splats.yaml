@@ -5,6 +5,7 @@ model:
   sh_degree: 0
   init_scale: 0.01
   init_opacity: 0.1
+  pretrained_ply: ""
 
 train:
   position_lr_init: 1.6e-4
