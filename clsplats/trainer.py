@@ -21,7 +21,7 @@ from clsplats.config import CLSplatsConfig
 from clsplats.constraints.primitives import fit_primitives_for_active, union_distance
 from clsplats.dataset.cameras import Camera
 from clsplats.dataset.dataset_reader import SceneInfo
-from clsplats.history import HistoryRecorder
+from clsplats.history import HistoryRecorder, load_raw_ply
 from clsplats.lifter.depth_anything_lifter import DepthAnythingLifter
 from clsplats.representation.cl_gaussians import CLGaussians, GaussianParams
 from clsplats.utils.sh_utils import RGB2SH
@@ -177,6 +177,32 @@ class CLSplatsTrainer:
         )
         # 3DGS scales the position learning rate by the camera extent.
         self.gaussians = CLGaussians(cfg, params, spatial_lr_scale=self.scene_extent)
+        
+        baseline_ply = Path("outputs/gaussians_time_30000.ply")
+
+        if baseline_ply.exists():
+            logger.info(
+                "Using pretrained 30000-iteration 3DGS: {path}",
+                path=baseline_ply,
+            )
+
+            raw = load_raw_ply(str(baseline_ply))
+            sh = torch.cat([raw["sh0"], raw["shN"]], dim=1)
+
+            params = GaussianParams(
+                positions=raw["means"],
+                scales=torch.exp(raw["scales"]),
+                quats=raw["quats"],
+                sh_features=sh.permute(0, 2, 1).contiguous(),
+                opacity=torch.sigmoid(raw["opacities"]).unsqueeze(-1),
+            )
+
+            self.gaussians = CLGaussians(
+                cfg,
+                params,
+                spatial_lr_scale=self.scene_extent,
+            )
+        
         self.gaussians.initialize_strategy_state(self.scene_extent)
 
         # 2) Cameras and change detector
@@ -553,7 +579,13 @@ class CLSplatsTrainer:
 
     def train(self) -> None:
         """Run the training loop for the current timestep."""
-        num_iters = self.cfg.train.iters_per_timestep
+        # num_iters = self.cfg.train.iters_per_timestep
+        # 최초 3DGS생성 시점에는 30000번 학습, 이후 timestep에서는 cfg에 정의된 iters_per_timestep만큼 학습
+        if self.timestep == self.cfg.train.start_time:
+            num_iters = 30000
+        else:
+            num_iters = self.cfg.train.iters_per_timestep
+        
         log_interval = self.cfg.train.log_interval
 
         for it in range(num_iters):

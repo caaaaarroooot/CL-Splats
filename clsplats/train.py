@@ -14,6 +14,7 @@ import typer
 import wandb
 from hydra.core.global_hydra import GlobalHydra
 from loguru import logger
+from pathlib import Path
 
 # Loguru defaults to stderr; redirect to stdout so XCloud doesn't flag
 # every INFO log as an error.
@@ -165,6 +166,14 @@ def main(
     active_scene = scene
 
     for time in range(cfg.train.start_time, num_times):
+        baseline_ply = Path("outputs/gaussians_time_30000.ply")
+
+        # Pretrained 3DGS already represents t0, so skip initial optimisation.
+        if time == 0 and baseline_ply.exists():
+            logger.info(
+                "Skipping t0 optimisation because pretrained PLY is loaded."
+            )
+            continue
         # For Blender temporal data: load the change-scene at t1
         if fmt == "Blender" and time > cfg.train.start_time and change_type:
             change_path = os.path.join(cfg.data_path, change_type)
