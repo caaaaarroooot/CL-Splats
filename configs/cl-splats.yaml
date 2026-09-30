@@ -62,6 +62,10 @@ constraints:
 history:
   log_history: false
 
+diagnostics:
+  enabled: false
+  out_dir: "outputs/diagnostics"
+
 wandb_project: "cl-splats"
 wandb_run_name: ""
 wandb_mode: "offline"

@@ -6,6 +6,7 @@ depth back-projection and Gaussian proximity scoring.
 """
 
 from typing import Optional
+import time
 
 import numpy as np
 import torch
@@ -81,7 +82,13 @@ class DepthAnythingLifter(BaseLifter):
         self.min_seed_views = lcfg.min_seed_views
         self.min_positive_ratio = lcfg.min_positive_ratio
         self.final_thresh = lcfg.final_thresh
-
+        self.diagnostics_enabled = cfg.diagnostics.enabled
+        self.last_stats: dict[str, float | int] = {}
+        
+    def _sync_cuda(self) -> None:
+        if self.diagnostics_enabled and torch.cuda.is_available():
+            torch.cuda.synchronize()
+        
     @torch.no_grad()
     def estimate_depth(self, observation: Image) -> torch.Tensor:
         """Estimate depth from an observation image ``[H, W, 3]`` in ``[0, 1]``.
@@ -119,6 +126,16 @@ class DepthAnythingLifter(BaseLifter):
         """
         device = gaussians.params.positions.device
         N = gaussians.params.positions.shape[0]
+        self.last_stats = {}
+
+        depth_estimation_sec = 0.0
+        depth_alignment_sec = 0.0
+
+        if self.diagnostics_enabled:
+            self._sync_cuda()
+            lift_start = time.perf_counter()
+        else:
+            lift_start = 0.0
 
         seed_score = torch.zeros(N, device=device)
         seed_votes = torch.zeros(N, device=device)
@@ -134,7 +151,17 @@ class DepthAnythingLifter(BaseLifter):
         skipped_views = 0
         for view_id, (cam, mask) in enumerate(zip(cameras, change_masks)):
             obs = cam.original_image.permute(1, 2, 0).contiguous()
-            depth = self.estimate_depth(obs).to(device)  # [H, W], relative
+
+            if self.diagnostics_enabled:
+                self._sync_cuda()
+                depth_start = time.perf_counter()
+
+            depth = self.estimate_depth(obs).to(device)
+
+            if self.diagnostics_enabled:
+                self._sync_cuda()
+                depth_estimation_sec += time.perf_counter() - depth_start
+
             mask = mask.to(device)
 
             # Monocular depth is relative — anchor it to the scene's metric
@@ -142,14 +169,26 @@ class DepthAnythingLifter(BaseLifter):
             # the alignment, back-projections land in empty space and the
             # depth-consistency gate rejects every Gaussian.
             if rendered_depths is not None:
+                if self.diagnostics_enabled:
+                    self._sync_cuda()
+                    alignment_start = time.perf_counter()
+
                 aligned = align_relative_depth(
                     mono=depth,
                     rendered_depth=rendered_depths[view_id].to(device),
                     change_mask=mask > 0.5,
                 )
+
+                if self.diagnostics_enabled:
+                    self._sync_cuda()
+                    depth_alignment_sec += (
+                        time.perf_counter() - alignment_start
+                    )
+
                 if aligned is None:
                     skipped_views += 1
                     continue
+
                 depth = aligned
 
             H, W = depth.shape
@@ -309,4 +348,25 @@ class DepthAnythingLifter(BaseLifter):
         score = torch.where(keep, score, torch.zeros_like(score))
 
         changed_gaussians = score > self.final_thresh
+
+        if self.diagnostics_enabled:
+            self._sync_cuda()
+
+            lifting_total_sec = time.perf_counter() - lift_start
+
+            self.last_stats = {
+                "total_views": len(cameras),
+                "valid_views": len(cameras) - skipped_views,
+                "skipped_views": skipped_views,
+                "depth_estimation_sec": depth_estimation_sec,
+                "depth_alignment_sec": depth_alignment_sec,
+                "lifting_total_sec": lifting_total_sec,
+                "lifting_other_sec": max(
+                    0.0,
+                    lifting_total_sec
+                    - depth_estimation_sec
+                    - depth_alignment_sec,
+                ),
+            }
+
         return changed_gaussians

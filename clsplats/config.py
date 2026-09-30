@@ -107,6 +107,7 @@ class CLSplatsConfig:
     lifter: LifterConfig = field(default_factory=LifterConfig)
     constraints: ConstraintsConfig = field(default_factory=ConstraintsConfig)
     history: HistoryConfig = field(default_factory=HistoryConfig)
+    diagnostics: DiagnosticsConfig = field(default_factory=DiagnosticsConfig)
 
     # Dataset arguments (usually overridden CLI or via basic YAML)
     data_path: str = "."
@@ -121,3 +122,10 @@ class CLSplatsConfig:
     wandb_project: str = "cl-splats"
     wandb_run_name: str = ""
     wandb_mode: str = "offline"
+
+@dataclass
+class DiagnosticsConfig:
+    """Diagnostic logging settings."""
+
+    enabled: bool = False
+    out_dir: str = "outputs/diagnostics"

@@ -4,6 +4,10 @@ Orchestrates the full continual-learning Gaussian Splatting pipeline:
 detect → lift → constrain → optimise → prune.
 """
 
+import csv
+import json
+import time
+from datetime import datetime
 from collections import defaultdict
 from pathlib import Path
 from random import randint
@@ -128,6 +132,52 @@ def _load_gt_image(
     return PILImage.fromarray((rgb * 255.0).astype(np.uint8), "RGB")
 
 
+_DIAGNOSTIC_FIELDS = [
+    "timestamp",
+    "phase",
+    "data_path",
+    "pretrained_ply",
+    "timestep",
+    "iterations",
+    "num_views",
+
+    "gaussians_before_prepare",
+
+    "render_sec",
+    "dino_sec",
+
+    "change_mask_mean_ratio",
+    "change_mask_min_ratio",
+    "change_mask_max_ratio",
+
+    "total_views",
+    "valid_views",
+    "skipped_views",
+
+    "depth_estimation_sec",
+    "depth_alignment_sec",
+    "lifting_other_sec",
+    "lifting_total_sec",
+
+    "active_gaussians",
+    "active_gaussian_ratio",
+
+    "prepare_sec",
+
+    "gaussians_before_train",
+    "gaussians_after_train",
+    "gaussian_count_delta",
+
+    "loss_first",
+    "loss_last",
+    "loss_mean",
+    "loss_min",
+    "loss_max",
+
+    "optimization_sec",
+    "total_update_sec",
+]
+
 class CLSplatsTrainer:
     """Minimal gsplat-backed trainer for continual-learning scene editing.
 
@@ -151,6 +201,8 @@ class CLSplatsTrainer:
         self.scene_extent = float(scene.nerf_normalization.get("radius", 1.0))
         self._is_nerf_synthetic = bool(scene.is_nerf_synthetic)
         self._history = HistoryRecorder()
+        self._diagnostics: dict[str, object] = {}
+        self._diagnostic_update_start: float | None = None
 
         # 1) Initialise Gaussians from scene point cloud
         pcd = scene.point_cloud
@@ -224,6 +276,81 @@ class CLSplatsTrainer:
 
         self.detector = DinoV2Detector(cfg.change)
         self.lifter = DepthAnythingLifter(cfg)
+        
+    def _sync_cuda(self) -> None:
+        if (
+            self.cfg.diagnostics.enabled
+            and self.device.type == "cuda"
+        ):
+            torch.cuda.synchronize()
+
+    def _save_diagnostics(self) -> None:
+        if (
+            not self.cfg.diagnostics.enabled
+            or not self._diagnostics
+        ):
+            return
+
+        out_dir = Path(self.cfg.diagnostics.out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        timestep = int(
+            self._diagnostics.get("timestep", self.timestep)
+        )
+
+        iterations = int(
+            self._diagnostics.get(
+                "iterations",
+                self.cfg.train.iters_per_timestep,
+            )
+        )
+
+        run_id = datetime.now().strftime(
+            "%Y%m%d_%H%M%S_%f"
+        )
+
+        json_path = out_dir / (
+            f"diagnostic_t{timestep:04d}"
+            f"_iter_{iterations}"
+            f"_{run_id}.json"
+        )
+
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(
+                self._diagnostics,
+                f,
+                indent=2,
+                ensure_ascii=False,
+            )
+
+        csv_path = out_dir / "summary.csv"
+        write_header = not csv_path.exists()
+
+        row = {
+            field: self._diagnostics.get(field, "")
+            for field in _DIAGNOSTIC_FIELDS
+        }
+
+        with open(
+            csv_path,
+            "a",
+            newline="",
+            encoding="utf-8",
+        ) as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=_DIAGNOSTIC_FIELDS,
+            )
+
+            if write_header:
+                writer.writeheader()
+
+            writer.writerow(row)
+
+        logger.info(
+            "Saved diagnostics: {json_path}",
+            json_path=json_path,
+        )
 
     def _reset_viewpoint_stack(self) -> None:
         self._viewpoint_stack = self.train_cameras.copy()
@@ -307,6 +434,32 @@ class CLSplatsTrainer:
 
         start_time = self.cfg.train.start_time
         is_initial = timestep == start_time
+        
+        if self.cfg.diagnostics.enabled:
+            self._sync_cuda()
+
+            self._diagnostic_update_start = (
+                time.perf_counter()
+            )
+
+            self._diagnostics = {
+                "timestamp": datetime.now().isoformat(
+                    timespec="seconds"
+                ),
+                "phase": (
+                    "initial"
+                    if is_initial
+                    else "continual"
+                ),
+                "data_path": self.cfg.data_path,
+                "pretrained_ply": (
+                    self.cfg.model.pretrained_ply
+                ),
+                "timestep": timestep,
+                "num_views": len(self.train_cameras),
+                "gaussians_before_prepare":
+                    self.gaussians.num_gaussians,
+            }
 
         # Fresh strategy + state per timestep: the densification window is
         # driven by the per-timestep iteration, and during the CL phase the
@@ -330,15 +483,68 @@ class CLSplatsTrainer:
         # to the scene's metric scale.
         change_masks = []
         rendered_depths = []
+
+        render_sec = 0.0
+        dino_sec = 0.0
+        change_ratios = []
+
         for cam in self.train_cameras:
             with torch.no_grad():
-                rendered, rendered_depth = self._render_camera(cam, return_depth=True)
-                change_mask_2d = self.detector.predict_change_mask(
-                    rendered_image=rendered,
-                    observation=cam.original_image.permute(1, 2, 0).contiguous().to(self.device),
+
+                # ---------- Existing GS render ----------
+                if self.cfg.diagnostics.enabled:
+                    self._sync_cuda()
+                    render_start = time.perf_counter()
+
+                rendered, rendered_depth = (
+                    self._render_camera(
+                        cam,
+                        return_depth=True,
+                    )
                 )
+
+                if self.cfg.diagnostics.enabled:
+                    self._sync_cuda()
+                    render_sec += (
+                        time.perf_counter()
+                        - render_start
+                    )
+
+                # ---------- DINO change detection ----------
+                if self.cfg.diagnostics.enabled:
+                    self._sync_cuda()
+                    dino_start = time.perf_counter()
+
+                change_mask_2d = (
+                    self.detector.predict_change_mask(
+                        rendered_image=rendered,
+                        observation=(
+                            cam.original_image
+                            .permute(1, 2, 0)
+                            .contiguous()
+                            .to(self.device)
+                        ),
+                    )
+                )
+
+                if self.cfg.diagnostics.enabled:
+                    self._sync_cuda()
+                    dino_sec += (
+                        time.perf_counter()
+                        - dino_start
+                    )
+
             change_masks.append(change_mask_2d)
             rendered_depths.append(rendered_depth)
+
+            if self.cfg.diagnostics.enabled:
+                ratio = float(
+                    (change_mask_2d > 0.5)
+                    .float()
+                    .mean()
+                    .item()
+                )
+                change_ratios.append(ratio)
 
         self.active_mask = self.lifter.lift(
             gaussians=self.gaussians,
@@ -346,6 +552,49 @@ class CLSplatsTrainer:
             change_masks=change_masks,
             rendered_depths=rendered_depths,
         )
+        
+        if self.cfg.diagnostics.enabled:
+            total_gaussians = (
+                self.gaussians.num_gaussians
+            )
+
+            active_gaussians = int(
+                self.active_mask.sum().item()
+            )
+
+            self._diagnostics.update({
+                "render_sec": render_sec,
+                "dino_sec": dino_sec,
+
+                "change_mask_mean_ratio": (
+                    sum(change_ratios)
+                    / len(change_ratios)
+                    if change_ratios
+                    else 0.0
+                ),
+                "change_mask_min_ratio": (
+                    min(change_ratios)
+                    if change_ratios
+                    else 0.0
+                ),
+                "change_mask_max_ratio": (
+                    max(change_ratios)
+                    if change_ratios
+                    else 0.0
+                ),
+
+                "active_gaussians":
+                    active_gaussians,
+
+                "active_gaussian_ratio": (
+                    active_gaussians
+                    / total_gaussians
+                    if total_gaussians > 0
+                    else 0.0
+                ),
+
+                **self.lifter.last_stats,
+            })
 
         # Inactive Gaussians must stay exactly frozen: zero their Adam
         # moments so leftover momentum from earlier timesteps cannot move
@@ -372,6 +621,18 @@ class CLSplatsTrainer:
             ]
         else:
             self._primitives = []
+            
+        if (
+            self.cfg.diagnostics.enabled
+            and self._diagnostic_update_start
+            is not None
+        ):
+            self._sync_cuda()
+
+            self._diagnostics["prepare_sec"] = (
+                time.perf_counter()
+                - self._diagnostic_update_start
+            )
 
     def _render_camera(self, cam: Camera, return_info: bool = False, return_depth: bool = False):
         """Render a single camera view using gsplat rasterisation.
@@ -583,18 +844,30 @@ class CLSplatsTrainer:
 
     def train(self) -> None:
         """Run the training loop for the current timestep."""
-        # num_iters = self.cfg.train.iters_per_timestep
-        # 최초 3DGS생성 시점에는 30000번 학습, 이후 timestep에서는 cfg에 정의된 iters_per_timestep만큼 학습
+
         if self.timestep == self.cfg.train.start_time:
             num_iters = 30000
         else:
             num_iters = self.cfg.train.iters_per_timestep
-        
+
         log_interval = self.cfg.train.log_interval
+
+        losses: list[float] = []
+
+        gaussians_before_train = (
+            self.gaussians.num_gaussians
+        )
+
+        if self.cfg.diagnostics.enabled:
+            self._sync_cuda()
+            optimization_start = time.perf_counter()
 
         for it in range(num_iters):
             cam = self._pop_random_train_camera()
             stats = self._train_step(cam)
+
+            if self.cfg.diagnostics.enabled:
+                losses.append(stats["loss"])
 
             if (it + 1) % log_interval == 0:
                 logger.info(
@@ -605,8 +878,67 @@ class CLSplatsTrainer:
                     loss=stats["loss"],
                 )
 
-        # Finalise the history delta for this timestep with the active
-        # lineage of the resulting array (densified children included).
+        # 여기부터 12번 코드
+        if self.cfg.diagnostics.enabled:
+            self._sync_cuda()
+
+            optimization_sec = (
+                time.perf_counter()
+                - optimization_start
+            )
+
+            gaussians_after_train = (
+                self.gaussians.num_gaussians
+            )
+
+            self._diagnostics.update({
+                "iterations": num_iters,
+
+                "gaussians_before_train":
+                    gaussians_before_train,
+
+                "gaussians_after_train":
+                    gaussians_after_train,
+
+                "gaussian_count_delta": (
+                    gaussians_after_train
+                    - gaussians_before_train
+                ),
+
+                "loss_first":
+                    losses[0] if losses else None,
+
+                "loss_last":
+                    losses[-1] if losses else None,
+
+                "loss_mean": (
+                    sum(losses) / len(losses)
+                    if losses
+                    else None
+                ),
+
+                "loss_min":
+                    min(losses) if losses else None,
+
+                "loss_max":
+                    max(losses) if losses else None,
+
+                "optimization_sec":
+                    optimization_sec,
+            })
+
+            if (
+                self._diagnostic_update_start
+                is not None
+            ):
+                self._diagnostics[
+                    "total_update_sec"
+                ] = (
+                    time.perf_counter()
+                    - self._diagnostic_update_start
+                )
+
+        # 기존 history 코드
         if (
             self.cfg.history.log_history
             and self._history.records
@@ -614,8 +946,13 @@ class CLSplatsTrainer:
             and self._history.records[-1].active_end_mask is None
             and self.active_mask is not None
         ):
-            self._history.end_timestep(self.active_mask)
+            self._history.end_timestep(
+                self.active_mask
+            )
 
+        # 마지막에 저장
+        if self.cfg.diagnostics.enabled:
+            self._save_diagnostics()
     # ------------------------------------------------------------------
     # Evaluation
     # ------------------------------------------------------------------
