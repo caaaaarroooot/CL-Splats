@@ -93,7 +93,7 @@ run_case() {
   echo "============================================================"
 
   cl-splats-train \
-    --offline \
+    --no-offline \
     --data-path "$DATA_PATH" \
     --change-type "$CHANGE_TYPE" \
     --white-background \
@@ -111,7 +111,8 @@ run_case() {
   local exit_code=${PIPESTATUS[0]}
   if [[ $exit_code -ne 0 ]]; then
     echo "FAILED: $label (exit=$exit_code)" | tee -a "$ROOT/FAILED.txt"
-    return 0
+    echo "Aborting queue after first failed run."
+    exit "$exit_code"
   fi
 
   local src_ply="outputs/ply/ply_${VIEWS}_${iters}.ply"
