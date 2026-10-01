@@ -135,6 +135,12 @@ class DepthAnythingLifter(BaseLifter):
         self.min_seed_views = lcfg.min_seed_views
         self.min_positive_ratio = lcfg.min_positive_ratio
         self.final_thresh = lcfg.final_thresh
+        self.max_positive_pixels = lcfg.max_positive_pixels
+        self.positive_chunk_size = lcfg.positive_chunk_size
+        if self.max_positive_pixels <= 0:
+            raise ValueError("lifter.max_positive_pixels must be > 0")
+        if self.positive_chunk_size <= 0:
+            raise ValueError("lifter.positive_chunk_size must be > 0")
         self.diagnostics_enabled = cfg.diagnostics.enabled
         self.last_stats: dict[str, object] = {}
 
@@ -208,6 +214,7 @@ class DepthAnythingLifter(BaseLifter):
         for view_id, (cam, mask) in enumerate(zip(cameras, change_masks)):
             positive_pixels_total = 0
             positive_pixels_sampled = 0
+            positive_chunks = 0
             radius_candidates = 0
             radius_passed = 0
             depth_passed = 0
@@ -258,95 +265,127 @@ class DepthAnythingLifter(BaseLifter):
 
                 depth = aligned
 
-            H, W = depth.shape
-
             # --- Positive pixels (changed) ---
             pos_pixels = (mask > 0.5) & torch.isfinite(depth) & (depth > 0)
             positive_pixels_total = int(pos_pixels.sum().item())
 
             if pos_pixels.any():
                 ys, xs = torch.nonzero(pos_pixels, as_tuple=True)
-                # Sub-sample to avoid OOM in the kNN distance matrix (M×N).
-                max_pos = min(ys.numel(), 2048)
+
+                # Sample up to the configured per-view budget once, then process
+                # that sample in bounded chunks. This keeps peak cdist memory
+                # near the original 2048-pixel implementation while allowing a
+                # larger total evidence budget per view.
+                max_pos = min(ys.numel(), self.max_positive_pixels)
                 if ys.numel() > max_pos:
                     perm = torch.randperm(ys.numel(), device=device)[:max_pos]
                     ys = ys[perm]
                     xs = xs[perm]
 
                 positive_pixels_sampled = int(ys.numel())
-                d = depth[ys, xs]
+                positive_chunks = (
+                    (positive_pixels_sampled + self.positive_chunk_size - 1)
+                    // self.positive_chunk_size
+                )
 
-                # Back-project to camera coordinates
-                x_cam = (xs.float() - cam.cx) / cam.fx * d
-                y_cam = (ys.float() - cam.cy) / cam.fy * d
-                z_cam = d
+                # A Gaussian may be reached by multiple chunks from the SAME
+                # camera. Multi-view counters must therefore be incremented
+                # only once per camera, after unioning all chunk hits.
+                positive_affected_this_view = torch.zeros(
+                    N, dtype=torch.bool, device=device
+                )
 
-                ones = torch.ones_like(z_cam)
-                p_cam = torch.stack([x_cam, y_cam, z_cam, ones], dim=-1)  # [M, 4]
-                # Twc is stored in the 3DGS transposed convention, so row
-                # vectors are transformed by right-multiplying it directly.
                 Twc = cam.Twc.to(device)  # [4, 4]
-                p_world_h = p_cam @ Twc  # [M, 4]
-                p_world = p_world_h[..., :3] / p_world_h[..., 3:]  # [M, 3]
+                Tcw = torch.inverse(Twc)  # [4, 4], transposed convention
 
-                # kNN in Gaussian means — cap M so cdist stays in memory
-                dists = torch.cdist(p_world, means)  # [M, N]
-                knn_dists, knn_idx = torch.topk(dists, k=min(self.k_nn, N), dim=-1, largest=False)
-                del dists  # free immediately
+                for chunk_start in range(0, positive_pixels_sampled, self.positive_chunk_size):
+                    chunk_end = min(
+                        chunk_start + self.positive_chunk_size,
+                        positive_pixels_sampled,
+                    )
+                    ys_c = ys[chunk_start:chunk_end]
+                    xs_c = xs[chunk_start:chunk_end]
+                    d = depth[ys_c, xs_c]
 
-                # Local scale-aware distance
-                local_scales = scales[knn_idx]  # [M, k, 3]
-                denom = local_scales.norm(dim=-1) + 1e-6  # [M, k]
-                d_local = knn_dists / denom
+                    # Back-project to camera coordinates
+                    x_cam = (xs_c.float() - cam.cx) / cam.fx * d
+                    y_cam = (ys_c.float() - cam.cy) / cam.fy * d
+                    z_cam = d
 
-                valid = d_local < self.local_radius_thresh  # [M, k]
+                    ones = torch.ones_like(z_cam)
+                    p_cam = torch.stack([x_cam, y_cam, z_cam, ones], dim=-1)
+                    p_world_h = p_cam @ Twc
+                    p_world = p_world_h[..., :3] / p_world_h[..., 3:]
 
-                radius_candidates = int(valid.numel())
-                radius_passed = int(valid.sum().item())
-                if valid.any():
-                    # Depth consistency: project only the k neighbour means (not all N)
-                    # into camera space — (M, k, 4) instead of (M, N, 4).
-                    Tcw = torch.inverse(Twc)  # [4, 4], transposed convention
-                    knn_means = means[knn_idx]  # [M, k, 3]
+                    # kNN in Gaussian means. Chunking bounds the M dimension so
+                    # torch.cdist peak memory does not scale with total budget.
+                    dists = torch.cdist(p_world, means)
+                    knn_dists, knn_idx = torch.topk(
+                        dists,
+                        k=min(self.k_nn, N),
+                        dim=-1,
+                        largest=False,
+                    )
+                    del dists
+
+                    local_scales = scales[knn_idx]
+                    denom = local_scales.norm(dim=-1) + 1e-6
+                    d_local = knn_dists / denom
+
+                    valid = d_local < self.local_radius_thresh
+                    radius_candidates += int(valid.numel())
+                    radius_passed += int(valid.sum().item())
+
+                    if not valid.any():
+                        continue
+
+                    # Depth consistency: project only k neighbour means.
+                    knn_means = means[knn_idx]
                     M, k = knn_means.shape[:2]
                     knn_means_h = torch.cat(
                         [knn_means, torch.ones(M, k, 1, device=device)], dim=-1
-                    )  # [M, k, 4]
-                    knn_cam = knn_means_h @ Tcw  # [M, k, 4]
-                    z_knn = knn_cam[..., 2]  # [M, k]
+                    )
+                    knn_cam = knn_means_h @ Tcw
+                    z_knn = knn_cam[..., 2]
 
-                    depth_pix = d.unsqueeze(-1)  # [M, 1]
+                    depth_pix = d.unsqueeze(-1)
                     depth_ok = (z_knn - depth_pix).abs() < (
                         self.depth_tol_abs + self.depth_tol_rel * depth_pix
                     )
+                    valid_final = valid & depth_ok
+                    depth_passed += int(valid_final.sum().item())
 
-                    valid_final = valid & depth_ok  # [M, k]
+                    if not valid_final.any():
+                        continue
 
-                    depth_passed = int(valid_final.sum().item())
+                    d_local_valid = d_local.masked_fill(~valid_final, 1e9)
+                    weights = torch.exp(-0.5 * d_local_valid**2)
+                    weights_sum = weights.sum(dim=-1, keepdim=True) + 1e-8
+                    weights = weights / weights_sum
 
-                    if valid_final.any():
-                        d_local_valid = d_local.masked_fill(~valid_final, 1e9)
-                        weights = torch.exp(-0.5 * d_local_valid**2)
-                        weights_sum = weights.sum(dim=-1, keepdim=True) + 1e-8
-                        weights = weights / weights_sum  # [M, k]
+                    mask_vals = mask[ys_c, xs_c].unsqueeze(-1).float()
+                    contrib = mask_vals * weights
 
-                        mask_vals = mask[ys, xs].unsqueeze(-1).float()  # [M, 1]
-                        contrib = mask_vals * weights  # [M, k]
+                    flat_idx = knn_idx.view(-1)
+                    flat_contrib = contrib.view(-1)
+                    flat_valid = valid_final.view(-1)
 
-                        flat_idx = knn_idx.view(-1)
-                        flat_contrib = contrib.view(-1)
-                        flat_valid = valid_final.view(-1)
+                    flat_idx = flat_idx[flat_valid]
+                    flat_contrib = flat_contrib[flat_valid]
 
-                        flat_idx = flat_idx[flat_valid]
-                        flat_contrib = flat_contrib[flat_valid]
+                    seed_score.index_add_(0, flat_idx, flat_contrib)
+                    seed_votes.index_add_(0, flat_idx, flat_contrib)
 
-                        seed_score.index_add_(0, flat_idx, flat_contrib)
-                        seed_votes.index_add_(0, flat_idx, flat_contrib)
+                    affected = torch.unique(flat_idx)
+                    positive_affected_this_view[affected] = True
 
-                        affected = torch.unique(flat_idx)
-                        positive_views[affected] += 1
-                        seed_views[affected] += 1
-                        visible_views[affected] += 1
+                affected = torch.nonzero(
+                    positive_affected_this_view, as_tuple=False
+                ).squeeze(1)
+                if affected.numel() > 0:
+                    positive_views[affected] += 1
+                    seed_views[affected] += 1
+                    visible_views[affected] += 1
 
             # --- Weak negatives from un-masked pixels (sub-sampled) ---
             neg_pixels = (~pos_pixels) & torch.isfinite(depth) & (depth > 0)
@@ -407,6 +446,7 @@ class DepthAnythingLifter(BaseLifter):
                     "image_name": cam.image_name,
                     "positive_pixels_total": positive_pixels_total,
                     "positive_pixels_sampled": positive_pixels_sampled,
+                    "positive_chunks": positive_chunks,
                     "radius_candidates": radius_candidates,
                     "radius_passed": radius_passed,
                     "depth_passed": depth_passed,
@@ -467,6 +507,8 @@ class DepthAnythingLifter(BaseLifter):
                 "total_views": len(cameras),
                 "valid_views": len(cameras) - skipped_views,
                 "skipped_views": skipped_views,
+                "max_positive_pixels": self.max_positive_pixels,
+                "positive_chunk_size": self.positive_chunk_size,
                 "depth_estimation_sec": depth_estimation_sec,
                 "depth_alignment_sec": depth_alignment_sec,
                 "lifting_total_sec": lifting_total_sec,
