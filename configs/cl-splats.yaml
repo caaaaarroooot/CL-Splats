@@ -57,6 +57,8 @@ lifter:
     min_seed_views: 1
     min_positive_ratio: 0.3
     final_thresh: 0.6
+    max_positive_pixels: 2048
+    positive_chunk_size: 2048
 
 constraints:
     group_radius_frac: 0.1
