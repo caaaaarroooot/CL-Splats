@@ -84,6 +84,12 @@ class LifterConfig:
     min_seed_views: int = 1
     min_positive_ratio: float = 0.3
     final_thresh: float = 0.6
+    # Total changed pixels sampled from each valid view before lifting.
+    # The original CL-Splats behaviour is 2048.
+    max_positive_pixels: int = 2048
+    # Process sampled positive pixels in bounded chunks so increasing
+    # max_positive_pixels does not increase peak cdist memory proportionally.
+    positive_chunk_size: int = 2048
 
 
 @dataclass
