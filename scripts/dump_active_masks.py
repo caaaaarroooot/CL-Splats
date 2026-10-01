@@ -66,6 +66,20 @@ def main():
     parser.add_argument("--min-positive-ratio", type=float, default=None)
     parser.add_argument("--final-thresh", type=float, default=None)
 
+    # Positive-pixel evidence-budget ablation parameters.
+    parser.add_argument(
+        "--max-positive-pixels",
+        type=int,
+        default=None,
+        help="Maximum changed pixels sampled per valid view before lifting.",
+    )
+    parser.add_argument(
+        "--positive-chunk-size",
+        type=int,
+        default=None,
+        help="Positive pixels processed per cdist chunk; keep 2048 to bound peak memory.",
+    )
+
     args = parser.parse_args()
 
     # ---------------------------------------------------------
@@ -87,7 +101,7 @@ def main():
     cfg.train.num_times = 2
     cfg.train.view_sample_seed = args.seed
 
-    # Apply lifter gate overrides BEFORE constructing the trainer/lifter.
+    # Apply lifter overrides BEFORE constructing the trainer/lifter.
     if args.min_visible_views is not None:
         cfg.lifter.min_visible_views = args.min_visible_views
     if args.min_positive_views is not None:
@@ -98,6 +112,10 @@ def main():
         cfg.lifter.min_positive_ratio = args.min_positive_ratio
     if args.final_thresh is not None:
         cfg.lifter.final_thresh = args.final_thresh
+    if args.max_positive_pixels is not None:
+        cfg.lifter.max_positive_pixels = args.max_positive_pixels
+    if args.positive_chunk_size is not None:
+        cfg.lifter.positive_chunk_size = args.positive_chunk_size
 
     cfg.history.log_history = False
     # Enable lifter.last_stats so each .pt records exactly which gate removed
@@ -116,6 +134,11 @@ def main():
         cfg.lifter.min_seed_views,
         cfg.lifter.min_positive_ratio,
         cfg.lifter.final_thresh,
+    )
+    logger.info(
+        "Positive budget: max_pixels/view={} chunk_size={}",
+        cfg.lifter.max_positive_pixels,
+        cfg.lifter.positive_chunk_size,
     )
 
     # ---------------------------------------------------------
@@ -187,6 +210,8 @@ def main():
                 "local_radius_thresh": float(cfg.lifter.local_radius_thresh),
                 "depth_tol_abs": float(cfg.lifter.depth_tol_abs),
                 "depth_tol_rel": float(cfg.lifter.depth_tol_rel),
+                "max_positive_pixels": int(cfg.lifter.max_positive_pixels),
+                "positive_chunk_size": int(cfg.lifter.positive_chunk_size),
             },
             "lifter_stats": dict(trainer.lifter.last_stats),
             "total_gaussians": int(active_mask.numel()),
@@ -221,6 +246,11 @@ def main():
                 mv.get("multiview_passed"),
                 fs.get("passed"),
             )
+        logger.info(
+            "Lifting time: {:.4f}s (other={:.4f}s)",
+            float(trainer.lifter.last_stats.get("lifting_total_sec", 0.0)),
+            float(trainer.lifter.last_stats.get("lifting_other_sec", 0.0)),
+        )
 
     logger.info("")
     logger.info("Finished.")
