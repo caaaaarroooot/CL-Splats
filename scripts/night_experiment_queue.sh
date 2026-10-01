@@ -2,7 +2,8 @@
 # Unattended CL-Splats experiment queue for 2026-10-01 night research.
 # IMPORTANT: run only on branch research/night-test-20261001.
 # This script does not modify source code; it only launches controlled experiments
-# and copies each run's outputs to a unique directory so later runs do not overwrite them.
+# and copies each run's outputs to a unique directory. Generic PLY/history/eval files
+# that existed before the run are backed up and restored on exit.
 
 set -u -o pipefail
 
@@ -12,7 +13,7 @@ ROOT="${ROOT:-outputs/night_20261001}"
 CHANGE_TYPE="${CHANGE_TYPE:-add}"
 VIEWS="${VIEWS:-5}"
 
-mkdir -p "$ROOT"/{logs,diag,ply,history}
+mkdir -p "$ROOT"/{logs,diag,ply,history,preexisting_backup}
 
 current_branch="$(git branch --show-current)"
 if [[ "$current_branch" != "research/night-test-20261001" ]]; then
@@ -25,6 +26,56 @@ if [[ ! -f "$BASE_PLY" ]]; then
   echo "ERROR: pretrained PLY not found: $BASE_PLY"
   exit 2
 fi
+
+# -----------------------------------------------------------------------------
+# Preserve generic outputs that this code path normally overwrites.
+# A trap restores them even if the queue is interrupted.
+# -----------------------------------------------------------------------------
+BACKUP="$ROOT/preexisting_backup"
+HAD_PLY_1000=0
+HAD_PLY_3000=0
+HAD_HISTORY=0
+HAD_EVAL=0
+
+if [[ -f "outputs/ply/ply_${VIEWS}_1000.ply" ]]; then
+  cp -a "outputs/ply/ply_${VIEWS}_1000.ply" "$BACKUP/ply_${VIEWS}_1000.ply"
+  HAD_PLY_1000=1
+fi
+if [[ -f "outputs/ply/ply_${VIEWS}_3000.ply" ]]; then
+  cp -a "outputs/ply/ply_${VIEWS}_3000.ply" "$BACKUP/ply_${VIEWS}_3000.ply"
+  HAD_PLY_3000=1
+fi
+if [[ -f "outputs/ply/history/t0001.pt" ]]; then
+  cp -a "outputs/ply/history/t0001.pt" "$BACKUP/t0001.pt"
+  HAD_HISTORY=1
+fi
+if [[ -d "outputs/eval/t0001" ]]; then
+  cp -a "outputs/eval/t0001" "$BACKUP/eval_t0001"
+  HAD_EVAL=1
+fi
+
+restore_preexisting() {
+  mkdir -p outputs/ply/history outputs/eval
+
+  rm -f "outputs/ply/ply_${VIEWS}_1000.ply"
+  rm -f "outputs/ply/ply_${VIEWS}_3000.ply"
+  rm -f "outputs/ply/history/t0001.pt"
+  rm -rf "outputs/eval/t0001"
+
+  if [[ $HAD_PLY_1000 -eq 1 ]]; then
+    cp -a "$BACKUP/ply_${VIEWS}_1000.ply" "outputs/ply/ply_${VIEWS}_1000.ply"
+  fi
+  if [[ $HAD_PLY_3000 -eq 1 ]]; then
+    cp -a "$BACKUP/ply_${VIEWS}_3000.ply" "outputs/ply/ply_${VIEWS}_3000.ply"
+  fi
+  if [[ $HAD_HISTORY -eq 1 ]]; then
+    cp -a "$BACKUP/t0001.pt" "outputs/ply/history/t0001.pt"
+  fi
+  if [[ $HAD_EVAL -eq 1 ]]; then
+    cp -a "$BACKUP/eval_t0001" "outputs/eval/t0001"
+  fi
+}
+trap restore_preexisting EXIT
 
 run_case() {
   local label="$1"
@@ -121,7 +172,6 @@ for iters in 1000 3000; do
     train.rotation_lr=0.0 \
     train.densify_from_iter=1000000 \
     train.densify_until_iter=1000001
-
 done
 
 # -----------------------------------------------------------------------------
