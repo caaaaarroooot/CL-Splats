@@ -34,3 +34,5 @@ python scripts/audit_depth_pipeline.py --image /path/to/one/changed_view.png --r
 Replace the placeholder image with a real image. `outputs/` is intentionally gitignored. Keep this benchmark separate from the training runs. The GPU/CPU comparison requires the same hardware environment and warmed model.
 
 **Status:** Branch creation and code/notes commits verified via GitHub connector. No Spark/GPU tests have run during this research session; do not cite the audit as measured performance.
+
+- `scripts/audit_lifting_support.py`: stdlib-only synthetic audit of ADD depth/radius eligibility and anisotropic top-k omission. Locally tested; not a Spark or 3DGS performance benchmark.
