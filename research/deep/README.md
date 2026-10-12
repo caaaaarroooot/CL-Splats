@@ -5,7 +5,8 @@ Research branch: `research/deep-20261012`, forked from `main` and isolated from 
 ## Artifacts
 
 - [Cumulative hourly research log](2026-10-12_to_2026-10-13.md): evidence classes, equations, literature, causal hypotheses, controlled test proposals, and implementation status.
-- [Convergence schedule and exposure audit](../../scripts/audit_convergence_schedule.py): **non-mutating, stdlib-only** prediction of the first eligible gsplat growth step (iteration 601 with current defaults), camera exposure counts, possible active-only pruning steps, and optional diagnostics summary. Committed; **not executed on Spark**.\n- [Depth pipeline audit script](../../scripts/audit_depth_pipeline.py): **non-mutating** inspection of Hugging Face Depth Anything float prediction vs 8-bit PIL visualization, CPU/GPU device selection, inference timing. **Committed but not executed on Spark**.
+- [Convergence schedule and exposure audit](../../scripts/audit_convergence_schedule.py): **non-mutating, stdlib-only** prediction of the first eligible gsplat growth step (iteration 601 with current defaults), camera exposure counts, possible active-only pruning steps, and optional diagnostics summary. Committed; **not executed on Spark**.
+- [Depth pipeline audit script](../../scripts/audit_depth_pipeline.py): **non-mutating** inspection of Hugging Face Depth Anything float prediction vs 8-bit PIL visualization, CPU/GPU device selection, inference timing. **Committed but not executed on Spark**.
 
 ## Convergence schedule audit (no GPU required)
 
