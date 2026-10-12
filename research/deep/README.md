@@ -8,6 +8,9 @@ Research branch: `research/deep-20261012`, forked from `main` and isolated from 
 - [Convergence schedule and exposure audit](../../scripts/audit_convergence_schedule.py): **non-mutating, stdlib-only** prediction of the first eligible gsplat growth step (iteration 601 with current defaults), camera exposure counts, possible active-only pruning steps, and optional diagnostics summary. Committed; **not executed on Spark**.
 - [Depth pipeline audit script](../../scripts/audit_depth_pipeline.py): **non-mutating** inspection of Hugging Face Depth Anything float prediction vs 8-bit PIL visualization, CPU/GPU device selection, inference timing. **Committed but not executed on Spark**.
 
+
+- [Depth calibration and Gaussian seed ablation protocol](depth_seed_ablation.md): D0–D4 float/uint8, LS/robust alignment comparisons and S0–S4 equal-capacity initialization comparisons (Mastering Regional and EDGS ideas). **Protocol only; no Spark/GPU execution.**
+
 ## Convergence schedule audit (no GPU required)
 
 From the repository root:
