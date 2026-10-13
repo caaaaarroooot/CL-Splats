@@ -20,7 +20,7 @@ from transformers import pipeline
 
 
 def sync(actual_device):
-    if str(device).startswith("cuda") and torch.cuda.is_available():
+    if str(actual_device).startswith("cuda") and torch.cuda.is_available():
         torch.cuda.synchronize()
 
 
@@ -55,10 +55,10 @@ def main():
     times = []
     result = None
     for _ in range(args.repeat + 1):  # first inference is warm-up
-        sync(device)
+        sync(actual_device)
         start = time.perf_counter()
         result = pipe(img)
-        sync(device)
+        sync(actual_device)
         elapsed = time.perf_counter() - start
         times.append(elapsed)
 
