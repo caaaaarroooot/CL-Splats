@@ -1,0 +1,137 @@
+{
+  "provenance": {
+    "date_kst": "2026-10-13",
+    "executor": "assistant isolated container (NOT Spark)",
+    "runtime": "Python 3.13.5; NumPy 2.3.5; torch 2.10.0+cpu; CUDA unavailable; transformers unavailable; gsplat unavailable",
+    "real_dataset": false,
+    "real_3dgs": false,
+    "seed": 42,
+    "script": "scripts/audit_four_core_20261013.py"
+  },
+  "float_depth_quantization": {
+    "synthetic_float_heldout_depth_mae_m": 0,
+    "synthetic_uint8_heldout_depth_mae_m": 0.00062194,
+    "raw_distinct_values": 19200,
+    "quantized_distinct_values": 256,
+    "actual_depth_anything_inference": "NOT EXECUTED"
+  },
+  "evidence_visibility": {
+    "positive_counts": [
+      2,
+      2,
+      0
+    ],
+    "negative_counts": [
+      5,
+      2,
+      5
+    ],
+    "same_camera_overlap": [
+      2,
+      1,
+      0
+    ],
+    "old_visible": [
+      7,
+      4,
+      5
+    ],
+    "camera_union_visible": [
+      5,
+      3,
+      5
+    ],
+    "old_positive_ratio": [
+      0.2857,
+      0.5,
+      0
+    ],
+    "union_positive_ratio": [
+      0.4,
+      0.6667,
+      0
+    ],
+    "old_gate_pass": [
+      false,
+      true,
+      false
+    ],
+    "union_gate_pass": [
+      true,
+      true,
+      false
+    ],
+    "after_synthetic_negative_depth_gate": [
+      true,
+      true,
+      false
+    ]
+  },
+  "novel_space_support": {
+    "ADD": {
+      "radius_any": 0,
+      "depth_any": 0,
+      "joint_any": 0,
+      "old_z": 5,
+      "new_z": 3
+    },
+    "DELETE": {
+      "radius_any": 0,
+      "depth_any": 0,
+      "joint_any": 0,
+      "old_z": 3,
+      "new_z": 5
+    },
+    "APPEARANCE": {
+      "radius_any": 1,
+      "depth_any": 1,
+      "joint_any": 1,
+      "old_z": 3,
+      "new_z": 3
+    },
+    "SMALL_GEOMETRY": {
+      "radius_any": 1,
+      "depth_any": 1,
+      "joint_any": 1,
+      "old_z": 3,
+      "new_z": 3.08
+    },
+    "AMBIGUOUS_POSE_DEPTH": {
+      "radius_any": 0,
+      "depth_any": 0,
+      "joint_any": 0,
+      "old_z": 3,
+      "new_z": 3.35
+    },
+    "samples_per_case": 256
+  },
+  "equal_count_toy_100steps": {
+    "description": "CPU torch 24 oracle-correspondence 3D points, 3 known cameras, reprojection-only Adam(lr=0.01), 100 steps, 10 seeds 40..49, no gsplat, no RGB image reconstruction",
+    "seeded_gaussians_per_arm": 24,
+    "mean_final_reprojection_rmse_px": {
+      "S1_random_old_depth": 1.061156,
+      "S2_float_depth_seed": 0.002158,
+      "S3_ratio_seed": 0.001003,
+      "S4_triangulated_seed": 0.000437
+    },
+    "mean_final_geometry_l2_m": {
+      "S1_random_old_depth": 1.006876,
+      "S2_float_depth_seed": 0.001094,
+      "S3_ratio_seed": 0.00052,
+      "S4_triangulated_seed": 0.000133
+    },
+    "sd_final_geometry_l2_m": {
+      "S1_random_old_depth": 0.045886,
+      "S2_float_depth_seed": 0.000177,
+      "S3_ratio_seed": 0.000069,
+      "S4_triangulated_seed": 0.000021
+    },
+    "S0_old_fixed": {
+      "new_count": 0,
+      "reprojection_rmse_px": 1.69356,
+      "geometry_l2_m": 2.02108
+    },
+    "measured_real_CL_Splats_100step": "NOT EXECUTED"
+  },
+  "caution": "Toy arms intentionally have different geometric seed accuracy, and use oracle point correspondences. This does not establish that real depth/ratio/triangulation produces those accuracies or improves CL-Splats. No real HF/GPU timing or project metrics were measured."
+}
