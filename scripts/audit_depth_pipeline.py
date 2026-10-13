@@ -19,7 +19,7 @@ from PIL import Image
 from transformers import pipeline
 
 
-def sync(device):
+def sync(actual_device):
     if str(device).startswith("cuda") and torch.cuda.is_available():
         torch.cuda.synchronize()
 
@@ -28,20 +28,28 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--image", required=True)
     p.add_argument("--model", default="depth-anything/Depth-Anything-V2-Small-hf")
-    p.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
+    p.add_argument("--device", choices=["auto", "cpu", "cuda", "production-default"], default="auto")
     p.add_argument("--repeat", type=int, default=3)
     args = p.parse_args()
     if args.repeat < 1:
         p.error("--repeat must be >=1")
 
     device = ("cuda" if torch.cuda.is_available() else "cpu") if args.device == "auto" else args.device
+    if device == "production-default":
+        device = None
     if device == "cuda" and not torch.cuda.is_available():
         p.error("CUDA requested but unavailable")
 
     img = Image.open(args.image).convert("RGB")
     t0 = time.perf_counter()
-    pipe = pipeline("depth-estimation", model=args.model, device=device)
-    sync(device)
+    # Production lifter constructs pipeline without device=; test that exact default separately.
+    if device is None:
+        pipe = pipeline("depth-estimation", model=args.model)
+    else:
+        pipe = pipeline("depth-estimation", model=args.model, device=device)
+    actual_device = str(pipe.device)
+    model_param_device = str(next(pipe.model.parameters()).device)
+    sync(actual_device)
     model_load_s = time.perf_counter() - t0
 
     times = []
@@ -66,8 +74,12 @@ def main():
     payload = {
         "image": args.image,
         "model": args.model,
-        "device_requested": device,
-        "pipeline_device": str(pipe.device),
+        "device_requested": args.device,
+        "device_argument_passed": device,
+        "torch_cuda_available": bool(torch.cuda.is_available()),
+        "torch_version": torch.__version__,
+        "model_parameter_device": model_param_device,
+        "pipeline_device": actual_device,
         "image_shape_hw": list(raw.shape),
         "load_seconds": round(model_load_s, 4),
         "warmup_seconds": round(times[0], 4),
